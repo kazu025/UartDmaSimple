@@ -110,6 +110,7 @@ void init_uart_dma(void){
 	// -- 最初のゴミ(0xFF)対策
 	uart_getc(UART_ID);
 	while(uart_is_readable(UART_ID)) uart_getc(UART_ID);
+	memset(tx_buf, 0, sizeof(tx_buf));
 	sleep_ms(10);
 	// --
 	uart_set_hw_flow(UART_ID, false, false);
@@ -212,49 +213,60 @@ void uart_dma_write_byte(uint8_t b){
 		break;
 	}
 }
-
 void uart_dma_write_string(const char *s){
 	while(*s) uart_dma_write_byte(*s++);
 }
-
-// 簡易テスト：FIFO ON、ポーリングで受信確認
-void test_uart_polling(void){
-    uart_init(UART_ID, BAUD_RATE);
-    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
-    gpio_pull_up(UART_RX_PIN);
-    uart_set_fifo_enabled(UART_ID, true); // ON
-    printf("polling test start\r\n");
-    while (1) {
-        if (uart_is_readable(UART_ID)) {
-            int c = uart_getc(UART_ID);
-            printf("recv: %c (0x%02x)\r\n", (char)c, c);
-        }
-        tight_loop_contents();
-    }
-}
-
-// ループバックテスト。GPIO0（TX）を物理的にGPIO1（RX）に接続して行う。
-void loopback_test(void){
-    uart_init(UART_ID, BAUD_RATE);
-    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
-    uart_set_fifo_enabled(UART_ID, true);
-    printf("loopback test start\r\n");
-	sleep_ms(10);
-	int c = uart_getc(UART_ID);
-	printf("pre recv: %c\n", c);
-	uart_putc(UART_ID, 'A');
-    sleep_ms(10);
-	if (uart_is_readable(UART_ID)) {
-		int c = uart_getc(UART_ID);
-		printf("loopback recv: %c\n", c);
-	} else {
-		printf("loopback no recv\n");
+/*
+ Uart TX DMA 安全送信ラッパ
+*/
+void uart_dma_safe_write_byte(uint8_t b){
+	uint32_t save = save_and_disable_interrupts();
+	// --- リングバッファに書き込み ---
+	uint16_t next = (tx_head + 1) & (TX_BUF_SIZE - 1);
+	while(next == tx_tail) tight_loop_contents(); // バッファ満杯なので待つ。
+	tx_buf[tx_head] = b;
+	tx_head = next;
+	// --- DMAが動いていない場合は開始 ---
+	if(!dma_channel_is_busy(dma_tx_chan)){
+		// UART TX FIFOが完全に空になるまで待つ
+		while(!uart_is_writable(UART_ID)) tight_loop_contents();
+		// DMA 完了待ち
+		while(dma_channel_is_busy(dma_tx_chan)) tight_loop_contents();
+		uint32_t count = (tx_head >= tx_tail) ? (tx_head - tx_tail) : (TX_BUF_SIZE - tx_tail);
+		tx_dma_active_count = count;
+		// DMA セットアップ
+		dma_channel_set_read_addr(dma_tx_chan, &tx_buf[tx_tail], false);
+		dma_channel_set_write_addr(dma_tx_chan, (void*)(UART_BASE + UART_UARTDR_OFFSET), false);
+		dma_channel_set_trans_count(dma_tx_chan, count, true);
 	}
-    while(1) tight_loop_contents();
+	restore_interrupts(save);
 }
+void uart_dma_safe_write_string(const char *s){
+	while(*s) uart_dma_safe_write_byte(*s++);
+}
+/*
+	文字列を一括送信(DMA) blocking版
+*/
+void uart_dma_send_block(const uint8_t *data, size_t len){
+	if(len == 0) return;
+	// DMAチャネルを1回だけ確保(静的確保)
+	static int dma_blk_chan = -1;
+	dma_blk_chan = dma_claim_unused_channel(true);
+	dma_channel_config c = dma_channel_get_default_config(dma_blk_chan);
+	channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
+	channel_config_set_read_increment(&c, true);
+	channel_config_set_write_increment(&c, false);				// UART DR 固定
+	channel_config_set_dreq(&c, uart_get_dreq(UART_ID, true));	// TX
 
+	dma_channel_configure(dma_blk_chan, &c,
+		(void*)(UART_BASE + UART_UARTDR_OFFSET),	// write addr : UART
+		data,										// reaad addr : data
+		len,										// 転送数
+		true										// 即スタート
+		);
+	// 送信待ち(blocking)
+	dma_channel_wait_for_finish_blocking(dma_blk_chan);
+}
 /*
 	main
 */
@@ -262,33 +274,17 @@ int main(void){
 	stdio_init_all();
 	led_init();
 	sleep_ms(2000);
-//	test_uart_polling();
-//	loopback_test();
 	init_uart_dma();
 	printf("start!\r\n");
+	char tmp[128];
 	while(1){
 		int ch = uart_dma_read_byte();
 		if(ch >= 0){
-			uart_dma_write_byte((uint8_t)ch);
+			sprintf(tmp, "read data %c\r\n", ch);
+			uart_dma_safe_write_string(tmp);
 			printf("read byte: %c\r\n", ch);
 			led_sw();
 		}
 		tight_loop_contents();
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
